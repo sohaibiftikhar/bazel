@@ -15,8 +15,13 @@
 package com.google.devtools.build.lib.rules.cpp;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.build.lib.actions.AbstractAction;
+import com.google.devtools.build.lib.actions.ActionContinuationOrResult;
 import com.google.devtools.build.lib.actions.ActionAnalysisMetadata;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
@@ -27,6 +32,13 @@ import com.google.devtools.build.lib.actions.ActionResult;
 import com.google.devtools.build.lib.actions.Actions;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
+import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.ResourceSet;
+import com.google.devtools.build.lib.actions.SimpleSpawn;
+import com.google.devtools.build.lib.actions.Spawn;
+import com.google.devtools.build.lib.actions.SpawnContinuation;
+import com.google.devtools.build.lib.actions.SpawnResult;
+import com.google.devtools.build.lib.actions.SpawnStrategy;
 import com.google.devtools.build.lib.analysis.RuleContext;
 import com.google.devtools.build.lib.analysis.actions.ActionConstructionContext;
 import com.google.devtools.build.lib.cmdline.Label;
@@ -39,6 +51,7 @@ import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.IOException;
+import javax.annotation.Nullable;
 
 /**
  * Creates mangled symlinks in the solib directory for all shared libraries. Libraries that have a
@@ -65,25 +78,97 @@ public final class SolibSymlinkAction extends AbstractAction {
   }
 
   @Override
-  public ActionResult execute(ActionExecutionContext actionExecutionContext)
-      throws ActionExecutionException {
-    Path mangledPath = actionExecutionContext.getInputPath(symlink);
-    try {
-      mangledPath.createSymbolicLink(actionExecutionContext.getInputPath(getPrimaryInput()));
-    } catch (IOException e) {
-      throw new ActionExecutionException(
-          "failed to create _solib symbolic link '"
-              + symlink.prettyPrint()
-              + "' to target '"
-              + getPrimaryInput()
-              + "': "
-              + e.getMessage(),
-          e,
-          this,
-          false);
-    }
-    return ActionResult.EMPTY;
+  public final ActionContinuationOrResult beginExecution(
+      ActionExecutionContext actionExecutionContext) throws ActionExecutionException, InterruptedException {
+
+    Spawn spawn = createSpawn(actionExecutionContext);
+    SpawnContinuation first =
+        actionExecutionContext
+            .getContext(SpawnStrategy.class)
+            .beginExecution(spawn, actionExecutionContext);
+    return new SolibSymlinkActionContinuation(actionExecutionContext, first);
   }
+
+  private Spawn createSpawn(ActionExecutionContext actionExecutionContext)
+      throws ActionExecutionException {
+    try {
+      Path srcPath = actionExecutionContext.getInputPath(getPrimaryInput());
+      return new SimpleSpawn(
+          this,
+          ImmutableList.of("ln", "-s", srcPath.toString(), symlink.getExecPathString()),
+          actionExecutionContext.getClientEnv(),
+          ImmutableMap.of(),
+          getInputs(),
+          getOutputs(),
+          ResourceSet.ZERO);
+    //TODO: This exception is too generic
+    } catch (Exception e) {
+      e.printStackTrace();
+      throw new ActionExecutionException(
+          "failed to generate SolibSymlink command for rule '"
+              + getOwner().getLabel()
+              + ": "
+              + e.getMessage(),
+          this,
+          /* catastrophe= */ false);
+    }
+  }
+
+  private final class SolibSymlinkActionContinuation extends ActionContinuationOrResult {
+    private final ActionExecutionContext actionExecutionContext;
+    private final SpawnContinuation spawnContinuation;
+
+    public SolibSymlinkActionContinuation(
+        ActionExecutionContext actionExecutionContext, SpawnContinuation spawnContinuation) {
+      this.actionExecutionContext = actionExecutionContext;
+      this.spawnContinuation = spawnContinuation;
+    }
+
+    @Nullable
+    @Override
+    public ListenableFuture<?> getFuture() {
+      return spawnContinuation.getFuture();
+    }
+
+    @Override
+    public ActionContinuationOrResult execute()
+        throws ActionExecutionException, InterruptedException {
+      SpawnContinuation nextContinuation;
+      try {
+        nextContinuation = spawnContinuation.execute();
+        if (!nextContinuation.isDone()) {
+          return new SolibSymlinkActionContinuation(actionExecutionContext, nextContinuation);
+        }
+      } catch (ExecException e) {
+        throw e.toActionExecutionException(
+            "Error creating SolibSymlink '" + Label.print(getOwner().getLabel()) + "'",
+            actionExecutionContext.getVerboseFailures(),
+            SolibSymlinkAction.this);
+      }
+      return ActionContinuationOrResult.of(ActionResult.create(nextContinuation.get()));
+    }
+  }
+
+//   @Override
+//   public ActionResult execute(ActionExecutionContext actionExecutionContext)
+//       throws ActionExecutionException {
+//     Path mangledPath = actionExecutionContext.getInputPath(symlink);
+//     try {
+//       mangledPath.createSymbolicLink(actionExecutionContext.getInputPath(getPrimaryInput()));
+//     } catch (IOException e) {
+//       throw new ActionExecutionException(
+//           "failed to create _solib symbolic link '"
+//               + symlink.prettyPrint()
+//               + "' to target '"
+//               + getPrimaryInput()
+//               + "': "
+//               + e.getMessage(),
+//           e,
+//           this,
+//           false);
+//     }
+//     return ActionResult.EMPTY;
+//   }
 
   @Override
   protected void computeKey(ActionKeyContext actionKeyContext, Fingerprint fp) {

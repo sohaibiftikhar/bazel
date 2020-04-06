@@ -15,15 +15,27 @@
 package com.google.devtools.build.lib.analysis.actions;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.build.lib.actions.AbstractAction;
+import com.google.devtools.build.lib.actions.ActionContinuationOrResult;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
 import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.actions.ActionResult;
 import com.google.devtools.build.lib.actions.Artifact;
+import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.ResourceSet;
+import com.google.devtools.build.lib.actions.SimpleSpawn;
+import com.google.devtools.build.lib.actions.Spawn;
+import com.google.devtools.build.lib.actions.SpawnContinuation;
+import com.google.devtools.build.lib.actions.SpawnResult;
+import com.google.devtools.build.lib.actions.SpawnStrategy;
+import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
@@ -172,28 +184,112 @@ public final class SymlinkAction extends AbstractAction {
   }
 
   @Override
-  public ActionResult execute(ActionExecutionContext actionExecutionContext)
-      throws ActionExecutionException {
+  public final ActionContinuationOrResult beginExecution(
+      ActionExecutionContext actionExecutionContext) throws ActionExecutionException, InterruptedException {
+
+    // Before Execute Block
     maybeVerifyTargetIsExecutable(actionExecutionContext);
+    // End Before Execute Block
 
-    Path srcPath;
-    if (inputPath == null) {
-      srcPath = actionExecutionContext.getInputPath(getPrimaryInput());
-    } else {
-      srcPath = actionExecutionContext.getExecRoot().getRelative(inputPath);
-    }
-    try {
-      getOutputPath(actionExecutionContext).createSymbolicLink(srcPath);
-    } catch (IOException e) {
-      throw new ActionExecutionException("failed to create symbolic link '"
-          + Iterables.getOnlyElement(getOutputs()).prettyPrint()
-          + "' to '" + printInputs()
-          + "' due to I/O error: " + e.getMessage(), e, this, false);
-    }
-
-    updateInputMtimeIfNeeded(actionExecutionContext);
-    return ActionResult.EMPTY;
+    Spawn spawn = createSpawn(actionExecutionContext);
+    SpawnContinuation first =
+        actionExecutionContext
+            .getContext(SpawnStrategy.class)
+            .beginExecution(spawn, actionExecutionContext);
+    return new SymlinkActionContinuation(actionExecutionContext, first);
   }
+
+  private Spawn createSpawn(ActionExecutionContext actionExecutionContext)
+      throws ActionExecutionException {
+    try {
+      Path srcPath;
+      if (inputPath == null) {
+        srcPath = actionExecutionContext.getInputPath(getPrimaryInput());
+      } else {
+        srcPath = actionExecutionContext.getExecRoot().getRelative(inputPath);
+      }
+      return new SimpleSpawn(
+          this,
+          ImmutableList.of("ln", "-s", srcPath.toString(), getPrimaryOutput().getExecPathString()),
+          actionExecutionContext.getClientEnv(),
+          ImmutableMap.of(),
+          getInputs(),
+          getOutputs(),
+          ResourceSet.ZERO);
+    //TODO: This exception is too generic
+    } catch (Exception e) {
+      e.printStackTrace();
+      throw new ActionExecutionException(
+          "failed to generate symlink command for rule '"
+              + getOwner().getLabel()
+              + ": "
+              + e.getMessage(),
+          this,
+          /* catastrophe= */ false);
+    }
+  }
+
+  private final class SymlinkActionContinuation extends ActionContinuationOrResult {
+    private final ActionExecutionContext actionExecutionContext;
+    private final SpawnContinuation spawnContinuation;
+
+    public SymlinkActionContinuation(
+        ActionExecutionContext actionExecutionContext, SpawnContinuation spawnContinuation) {
+      this.actionExecutionContext = actionExecutionContext;
+      this.spawnContinuation = spawnContinuation;
+    }
+
+    @Nullable
+    @Override
+    public ListenableFuture<?> getFuture() {
+      return spawnContinuation.getFuture();
+    }
+
+    @Override
+    public ActionContinuationOrResult execute()
+        throws ActionExecutionException, InterruptedException {
+      SpawnContinuation nextContinuation;
+      try {
+        nextContinuation = spawnContinuation.execute();
+        if (!nextContinuation.isDone()) {
+          return new SymlinkActionContinuation(actionExecutionContext, nextContinuation);
+        }
+        // After Execute Block
+        updateInputMtimeIfNeeded(actionExecutionContext);
+        // End After Execute Block
+      } catch (ExecException e) {
+        throw e.toActionExecutionException(
+            "Error creating Symlink '" + Label.print(getOwner().getLabel()) + "'",
+            actionExecutionContext.getVerboseFailures(),
+            SymlinkAction.this);
+      }
+      return ActionContinuationOrResult.of(ActionResult.create(nextContinuation.get()));
+    }
+  }
+
+//   @Override
+//   public ActionResult execute(ActionExecutionContext actionExecutionContext)
+//       throws ActionExecutionException {
+//     maybeVerifyTargetIsExecutable(actionExecutionContext);
+// 
+//     Path srcPath;
+//     if (inputPath == null) {
+//       srcPath = actionExecutionContext.getInputPath(getPrimaryInput());
+//     } else {
+//       srcPath = actionExecutionContext.getExecRoot().getRelative(inputPath);
+//     }
+//     try {
+//       getOutputPath(actionExecutionContext).createSymbolicLink(srcPath);
+//     } catch (IOException e) {
+//       throw new ActionExecutionException("failed to create symbolic link '"
+//           + Iterables.getOnlyElement(getOutputs()).prettyPrint()
+//           + "' to '" + printInputs()
+//           + "' due to I/O error: " + e.getMessage(), e, this, false);
+//     }
+// 
+//     updateInputMtimeIfNeeded(actionExecutionContext);
+//     return ActionResult.EMPTY;
+//   }
 
   private void maybeVerifyTargetIsExecutable(ActionExecutionContext actionExecutionContext)
       throws ActionExecutionException {
